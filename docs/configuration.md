@@ -71,6 +71,16 @@ cp .env.example .env.development
 
 ---
 
+## MCP (optional)
+
+MCP tools are loaded from external servers when configured. See [MCP](mcp.md) for the full guide, transports, and security notes.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `MCP_SERVERS` | `` (disabled) | JSON object mapping server names to connection details (transport, command/args/env for stdio, url/headers for streamable_http/sse) |
+
+---
+
 ## Cache (Valkey/Redis — optional)
 
 When `VALKEY_HOST` is set, the app uses Valkey/Redis for memory search caching and rate limiting. When absent, it falls back to an in-memory TTL cache (not shared across instances).

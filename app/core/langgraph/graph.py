@@ -4,7 +4,6 @@ import asyncio
 from typing import (
     AsyncGenerator,
     Optional,
-    cast,
 )
 from urllib.parse import quote_plus
 
@@ -41,10 +40,8 @@ from psycopg.rows import (
 )
 from psycopg_pool import AsyncConnectionPool
 
-from app.core.config import (
-    Environment,
-    settings,
-)
+from app.core.config import settings
+from app.core.langgraph.mcp import load_mcp_tools, parse_mcp_servers
 from app.core.langgraph.tools import tools
 from app.core.logging import logger
 from app.core.metrics import llm_inference_duration_seconds
@@ -62,6 +59,7 @@ from app.utils import (
     prepare_messages,
     process_llm_response,
 )
+from app.utils.tasks import create_background_task
 
 PostgresConnPool = AsyncConnectionPool[AsyncConnection[DictRow]]
 
@@ -79,6 +77,11 @@ class LangGraphAgent:
         self.llm_service = llm_service
         self.llm_service.bind_tools(tools)
         self.tools_by_name = {tool.name: tool for tool in tools}
+        # MCP tools are loaded lazily in create_graph(), once, because
+        # loading them is async and the client must stay alive while
+        # its tools are in use. Built-in tools always win on name clash.
+        self._mcp_client = None
+        self._mcp_tools_loaded = False
         self._connection_pool: Optional[PostgresConnPool] = None
         self._graph: Optional[CompiledStateGraph] = None
         logger.info(
@@ -87,12 +90,14 @@ class LangGraphAgent:
             environment=settings.ENVIRONMENT.value,
         )
 
-    async def _get_connection_pool(self) -> Optional[PostgresConnPool]:
+    async def _get_connection_pool(self) -> PostgresConnPool:
         """Get a PostgreSQL connection pool using environment-specific settings.
 
         Returns:
-            AsyncConnectionPool or None when the pool fails to initialise in
-            production (the app keeps running in a degraded mode).
+            AsyncConnectionPool: The open connection pool.
+
+        Raises:
+            Exception: If the pool cannot be created, in every environment.
         """
         if self._connection_pool is None:
             try:
@@ -119,11 +124,12 @@ class LangGraphAgent:
                 await self._connection_pool.open()
                 logger.info("connection_pool_created", max_size=max_size, environment=settings.ENVIRONMENT.value)
             except Exception as e:
-                logger.error("connection_pool_creation_failed", error=str(e), environment=settings.ENVIRONMENT.value)
-                # In production, we might want to degrade gracefully
-                if settings.ENVIRONMENT == Environment.PRODUCTION:
-                    logger.warning("continuing_without_connection_pool", environment=settings.ENVIRONMENT.value)
-                    return None
+                logger.exception(
+                    "connection_pool_creation_failed", error=str(e), environment=settings.ENVIRONMENT.value
+                )
+                # Never degrade silently: the checkpointer is the only store for
+                # conversation history and HITL resume state. Serving without it
+                # loses data rather than surfacing an outage.
                 raise e
         return self._connection_pool
 
@@ -211,14 +217,59 @@ class LangGraphAgent:
 
         return Command(update={"messages": outputs}, goto="chat")
 
-    async def create_graph(self) -> Optional[CompiledStateGraph]:
+    async def _load_mcp_tools(self) -> None:
+        """Load MCP tools once, if any MCP servers are configured.
+
+        On any failure, MCP is skipped and the agent keeps running with
+        its built-in tools only. A misconfigured or unreachable MCP
+        server must not take the whole agent down.
+        """
+        if self._mcp_tools_loaded:
+            return
+        self._mcp_tools_loaded = True
+
+        try:
+            servers = parse_mcp_servers(settings.MCP_SERVERS)
+        except ValueError as e:
+            logger.warning("mcp_config_invalid_skipping_mcp_tools", error=str(e))
+            return
+        if not servers:
+            return
+
+        try:
+            mcp_tools, client = await load_mcp_tools(servers)
+        except Exception as e:
+            logger.warning(
+                "mcp_tools_load_failed_using_builtin_tools_only",
+                server_count=len(servers),
+                error=str(e),
+            )
+            return
+
+        self._mcp_client = client
+        added = 0
+        for tool in mcp_tools:
+            if tool.name in self.tools_by_name:
+                logger.warning("mcp_tool_name_conflict_skipped", tool_name=tool.name)
+                continue
+            self.tools_by_name[tool.name] = tool
+            added += 1
+        if added:
+            self.llm_service.bind_tools(list(self.tools_by_name.values()))
+            logger.info("mcp_tools_loaded", tool_count=added, server_count=len(servers))
+
+    async def create_graph(self) -> CompiledStateGraph:
         """Create and configure the LangGraph workflow.
 
         Returns:
-            Optional[CompiledStateGraph]: The configured LangGraph instance or None if init fails
+            CompiledStateGraph: The configured LangGraph instance, always with a checkpointer.
+
+        Raises:
+            Exception: If the graph cannot be built, in every environment.
         """
         if self._graph is None:
             try:
+                await self._load_mcp_tools()
                 graph_builder = StateGraph(GraphState)
                 graph_builder.add_node("chat", self._chat, destinations=("tool_call", END))
                 graph_builder.add_node(
@@ -230,16 +281,10 @@ class LangGraphAgent:
                 graph_builder.set_entry_point("chat")
                 graph_builder.set_finish_point("chat")
 
-                # Get connection pool (may be None in production if DB unavailable)
+                # Raises if the pool cannot be created — no checkpointer, no service.
                 connection_pool = await self._get_connection_pool()
-                if connection_pool:
-                    checkpointer = AsyncPostgresSaver(connection_pool)
-                    await checkpointer.setup()
-                else:
-                    # In production, proceed without checkpointer if needed
-                    checkpointer = None
-                    if settings.ENVIRONMENT != Environment.PRODUCTION:
-                        raise Exception("Connection pool initialization failed")
+                checkpointer = AsyncPostgresSaver(connection_pool)
+                await checkpointer.setup()
 
                 self._graph = graph_builder.compile(
                     checkpointer=checkpointer, name=f"{settings.PROJECT_NAME} Agent ({settings.ENVIRONMENT.value})"
@@ -252,11 +297,7 @@ class LangGraphAgent:
                     has_checkpointer=checkpointer is not None,
                 )
             except Exception as e:
-                logger.error("graph_creation_failed", error=str(e), environment=settings.ENVIRONMENT.value)
-                # In production, we don't want to crash the app
-                if settings.ENVIRONMENT == Environment.PRODUCTION:
-                    logger.warning("continuing_without_graph")
-                    return None
+                logger.exception("graph_creation_failed", error=str(e), environment=settings.ENVIRONMENT.value)
                 raise e
 
         return self._graph
@@ -265,14 +306,11 @@ class LangGraphAgent:
         """Return the compiled graph, creating it on first access.
 
         Raises:
-            RuntimeError: When ``create_graph()`` swallowed an init failure
-                (production-only path) and returned ``None``. Callers can
-                rely on the return being non-``None``.
+            Exception: Propagated from ``create_graph()`` when initialisation
+                fails. Callers can rely on the return being non-``None``.
         """
         if self._graph is None:
             self._graph = await self.create_graph()
-        if self._graph is None:
-            raise RuntimeError("graph initialization failed")
         return self._graph
 
     async def get_response(
@@ -334,8 +372,7 @@ class LangGraphAgent:
                 logger.info("graph_interrupted", session_id=session_id, interrupt_value=str(interrupt_value))
                 return [Message(role="assistant", content=str(interrupt_value))]
 
-            openai_msgs = cast(list[dict], convert_to_openai_messages(response["messages"]))
-            asyncio.create_task(memory_service.add(user_id, openai_msgs, config.get("metadata")))
+            create_background_task(memory_service.add(user_id, response["messages"]))
             return self.__process_messages(response["messages"])
         except GraphInterrupt:
             state = await graph.aget_state(config)
@@ -411,8 +448,7 @@ class LangGraphAgent:
                 logger.info("graph_interrupted_stream", session_id=session_id, interrupt_value=str(interrupt_value))
                 yield str(interrupt_value)
             elif state.values and "messages" in state.values:
-                openai_msgs = cast(list[dict], convert_to_openai_messages(state.values["messages"]))
-                asyncio.create_task(memory_service.add(user_id, openai_msgs, config.get("metadata")))
+                create_background_task(memory_service.add(user_id, state.values["messages"]))
         except GraphInterrupt:
             state = await graph.aget_state(config)
             interrupt_value = state.tasks[0].interrupts[0].value if state.tasks else "Waiting for input."
